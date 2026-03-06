@@ -123,14 +123,7 @@ document.getElementById("form").addEventListener("submit", async (e) => {
     });
 
     const data = await res.json().catch(() => ({}));
-
-    if (res.ok && data.ok) {
-        window.location.href = "https://2026bts.com";
-    } else {
-        field.classList.remove("input-neutral");
-        field.classList.add("input-bad");
-        hint.textContent = data.error || "Submission failed";
-    }
+    field.value = "";   
 });
 
 checkAttestation();
