@@ -1,0 +1,8 @@
+.git
+.github
+build
+target
+.nitro-cli
+README.md
+scripts
+tools
