@@ -1,0 +1,8 @@
+service: demo-server
+workload_id: ztbrowser-aws-nitro
+repo_url: https://github.com/tatiosen/demo-server
+project_repo_url: https://github.com/rusyaew/ztbrowser
+coco:
+  platform: aws_coco_snp
+  attestation_path: /.well-known/attestation
+  aa_evidence_url: http://127.0.0.1:8006/aa/evidence

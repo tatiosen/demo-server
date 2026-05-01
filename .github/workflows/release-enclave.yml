@@ -16,7 +16,7 @@ jobs:
     timeout-minutes: 45
     env:
       WORKLOAD_ID: ztbrowser-aws-nitro
-      ENCLAVE_REPO_URL: https://github.com/rusyaew/ztinfra-enclaveproducedhtml
+      ENCLAVE_REPO_URL: https://github.com/tatiosen/demo-server
       PROJECT_REPO_URL: https://github.com/rusyaew/ztbrowser
       NITRO_CLI_SOURCE_REPO: https://github.com/aws/aws-nitro-enclaves-cli.git
       NITRO_CLI_SOURCE_TAG: v1.4.4
@@ -65,6 +65,14 @@ jobs:
           echo "CARGO_VERSION=$(cargo --version | awk '{print $2}')" >> "$GITHUB_ENV"
           echo "NITRO_CLI_VERSION=$(nitro-cli --version | awk '{print $NF}')" >> "$GITHUB_ENV"
 
+      - name: Build reproducible CoCo workload image
+        env:
+          COCO_IMAGE_REF: ghcr.io/${{ github.repository_owner }}/micrus:${{ github.ref_name }}
+        run: |
+          COCO_DEPLOY_IMAGE_DIGEST="$IMAGE_DIGEST" scripts/build-coco-image.sh build
+          COCO_IMAGE_DIGEST="$(cat build/coco-image-digest.txt)"
+          echo "COCO_IMAGE_DIGEST=$COCO_IMAGE_DIGEST" >> "$GITHUB_ENV"
+
       - name: Generate provenance and checksums
         run: |
           python3 tools/generate_provenance.py \
@@ -84,8 +92,28 @@ jobs:
             --rust-version "$RUST_VERSION" \
             --cargo-version "$CARGO_VERSION" \
             --output-path build/provenance.json
-          (cd build && sha256sum ztbrowser-enclave.eif describe-eif.json provenance.json > SHA256SUMS)
-          python3 tools/render_facts_row.py --provenance build/provenance.json > build/facts-row.json
+          python3 tools/generate_coco_artifacts.py \
+            --service-config ztinfra-service.yaml \
+            --release-id "${GITHUB_REF_NAME}" \
+            --coco-image-digest "$COCO_IMAGE_DIGEST" \
+            --initdata-path build/coco-initdata.json \
+            --runtime-config-path build/coco-runtime-config.json
+          python3 tools/generate_release_manifest.py \
+            --service-config ztinfra-service.yaml \
+            --provenance build/provenance.json \
+            --release-url "https://github.com/${GITHUB_REPOSITORY}/releases/tag/${GITHUB_REF_NAME}" \
+            --coco-image-digest "$COCO_IMAGE_DIGEST" \
+            --coco-initdata-path build/coco-initdata.json \
+            --manifest-path build/release-manifest.json \
+            --coco-runtime-config-path build/coco-runtime-config.json
+          python3 tools/verify_coco_release.py \
+            --release-manifest build/release-manifest.json \
+            --runtime-config build/coco-runtime-config.json \
+            --initdata build/coco-initdata.json \
+            --coco-image-digest build/coco-image-digest.txt \
+            --oci-archive build/coco-workload.oci.tar
+          (cd build && sha256sum ztbrowser-enclave.eif describe-eif.json provenance.json release-manifest.json coco-runtime-config.json coco-initdata.json coco-image-digest.txt coco-image-ref.txt coco-oci-manifest-digest.txt coco-workload.oci.tar coco-workload.oci.tar.sha256 > SHA256SUMS)
+          python3 tools/render_facts_row.py --release-manifest build/release-manifest.json > build/facts-row.json
 
       - name: Publish GitHub release assets
         uses: softprops/action-gh-release@v2
@@ -94,6 +122,14 @@ jobs:
             build/ztbrowser-enclave.eif
             build/describe-eif.json
             build/provenance.json
+            build/release-manifest.json
+            build/coco-runtime-config.json
+            build/coco-initdata.json
+            build/coco-image-digest.txt
+            build/coco-image-ref.txt
+            build/coco-oci-manifest-digest.txt
+            build/coco-workload.oci.tar
+            build/coco-workload.oci.tar.sha256
             build/SHA256SUMS
 
       - name: Check out facts target repo
@@ -127,4 +163,4 @@ jobs:
             - commit_sha: ${{ github.sha }}
             - release_url: https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}
 
-            The exact EIF/provenance values come from `build/provenance.json` in this release workflow.
+            The exact release identity values come from `build/release-manifest.json` in this release workflow.

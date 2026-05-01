@@ -19,6 +19,13 @@ Canonical releases publish:
 - `ztbrowser-enclave.eif`
 - `describe-eif.json`
 - `provenance.json`
+- `release-manifest.json`
+- `coco-runtime-config.json`
+- `coco-initdata.json`
+- `coco-image-digest.txt`
+- `coco-image-ref.txt`
+- `coco-oci-manifest-digest.txt`
+- `coco-workload.oci.tar`
 - `SHA256SUMS`
 
 `ztbrowser` consumes those release artifacts directly for real AWS deploys.
@@ -84,7 +91,7 @@ This uses the Flask app in [`src/server.py`](/Users/tati/tanyaserver/src/server.
 
 ```bash
 docker build -t micrus .
-docker run --rm -p 5005:5005 -e PORT=5005 -e ATTESTATION_SOURCE=demo micrus
+docker run --rm -p 5005:5005 -e RUNTIME_MODE=http -e PORT=5005 -e ATTESTATION_SOURCE=demo micrus
 ```
 
 Then open:
@@ -98,6 +105,25 @@ Notes:
 - `ATTESTATION_SOURCE=demo` works in a normal container.
 - `ATTESTATION_SOURCE=nitro` requires a real Nitro Enclave with `/dev/nsm` available and the `nsm-attestor` helper binary on `PATH` or configured via `NSM_ATTESTOR_BIN`.
 - This container flow is for local development and UI testing, not for producing canonical enclave release artifacts.
+
+## Attested response signing
+
+The service generates an ephemeral P-256 response signing key inside the trusted runtime.
+Attestation envelopes use `ztinfra-attestation/v1` and include:
+
+- `claims.response_signing_key`
+- `claims.response_signing_key_id`
+- `claims.response_signing_key_binding`
+
+When a request includes `X-ZT-Challenge`, the service signs the exact response body and
+returns `X-ZT-Signature-Version`, `X-ZT-Key-Id`, `X-ZT-Content-Digest`,
+`X-ZT-Signature`, `X-ZT-Signed-At`, and `X-ZT-Challenge`.
+
+Runtime modes:
+
+- default: Nitro enclave vsock JSON protocol for the ZTBrowser parent proxy
+- `RUNTIME_MODE=http`: local Flask HTTP development
+- `RUNTIME_MODE=coco_http`: AWS CoCo / PeerPods HTTP workload mode
 
 ## Current Scope
 

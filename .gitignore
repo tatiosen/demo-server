@@ -14,6 +14,8 @@ out/
 .sts4-cache
 bin/
 !**/src/main/**/bin/
+!src/bin/
+!src/bin/**
 !**/src/test/**/bin/
 
 ### NetBeans ###
@@ -28,3 +30,10 @@ bin/
 
 ### Mac OS ###
 .DS_Store
+
+### Local build/test artifacts ###
+.venv/
+__pycache__/
+*.pyc
+target/
+build/
