@@ -402,7 +402,7 @@ def build_attestation_envelope(
         service = str(config.get("service") or service)
         rel = str(config.get("release_id") or rel)
         binding = response_key_binding_hash(
-            nonce, key_id, public_jwk, service, rel, platform, "sha512"
+            nonce, key_id, public_jwk, service, rel, platform, "sha256"
         )
         evidence = fetch_coco_aa_evidence(
             str(config.get("aa_evidence_url") or "http://127.0.0.1:8006/aa/evidence"),

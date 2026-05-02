@@ -42,10 +42,10 @@ class ResponseSigningTests(unittest.TestCase):
             "demo-server",
             "v0.1.0",
             server.COCO_PLATFORM,
-            "sha512",
+            "sha256",
         )
         self.assertEqual(len(nitro), 64)
-        self.assertEqual(len(coco), 128)
+        self.assertEqual(len(coco), 64)
 
     def test_challenged_landing_page_is_signed(self) -> None:
         challenge = "cd" * 32
