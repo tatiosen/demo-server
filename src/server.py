@@ -8,8 +8,8 @@ import socket
 import subprocess
 import time
 from datetime import datetime, timedelta
-from urllib.parse import urlencode, urlparse
-from urllib.request import urlopen
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from urllib.request import Request, urlopen
 
 import cbor2
 from cryptography import x509
@@ -373,9 +373,15 @@ def fetch_coco_aa_evidence(aa_evidence_url: str, runtime_data_hex: str) -> objec
     parsed = urlparse(aa_evidence_url)
     if parsed.scheme != "http":
         raise RuntimeError("only http:// AA evidence URLs are supported")
-    separator = "&" if parsed.query else "?"
-    url = aa_evidence_url + separator + urlencode({"runtime_data": runtime_data_hex})
-    with urlopen(url, timeout=10) as response:
+    query = [
+        (key, value)
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+        if key != "runtime_data"
+    ]
+    query.append(("runtime_data", runtime_data_hex))
+    url = urlunparse(parsed._replace(query=urlencode(query)))
+    request_obj = Request(url, headers={"Accept": "application/json"})
+    with urlopen(request_obj, timeout=10) as response:
         return json.loads(response.read().decode())
 
 
