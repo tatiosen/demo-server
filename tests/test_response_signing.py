@@ -1,6 +1,8 @@
 import base64
 import hashlib
 import json
+import os
+import tempfile
 import unittest
 
 from cryptography.hazmat.primitives import hashes
@@ -17,6 +19,15 @@ class ResponseSigningTests(unittest.TestCase):
     def setUp(self) -> None:
         server.ATTESTATION_MODE["value"] = "valid"
         server.MODE["value"] = "verified"
+        self._submit_log = tempfile.NamedTemporaryFile(delete=False)
+        self._submit_log.close()
+        server.SUBMIT_LOG = self._submit_log.name
+        with open(server.SUBMIT_LOG, "w", encoding="utf-8") as submit_log:
+            json.dump([], submit_log)
+
+    def tearDown(self) -> None:
+        if os.path.exists(self._submit_log.name):
+            os.unlink(self._submit_log.name)
 
     def test_key_id_and_binding_hashes_are_well_formed(self) -> None:
         jwk = server.response_public_jwk()
@@ -95,6 +106,57 @@ class ResponseSigningTests(unittest.TestCase):
         self.assertEqual(envelope["evidence"]["type"], "aws_nitro_attestation_doc")
         self.assertEqual(claims["response_signing_key_id"], server.response_key_id(claims["response_signing_key"]))
         self.assertEqual(len(claims["response_signing_key_binding"]), 64)
+        self.assertEqual(json.loads(claims["workload_pubkey"])["kty"], "EC")
+        self.assertEqual(claims["trusted_input_service"]["version"], "ztbrowser-trusted-inputs/v1")
+        self.assertEqual(
+            claims["trusted_input_service"]["profiles"][0]["submit"]["url"],
+            "http://localhost:9999/v1/submit",
+        )
+
+    def test_landing_page_contains_trusted_input_manifest_and_fields(self) -> None:
+        client = server.app.test_client()
+        response = client.get("/", base_url="http://demo.example")
+        self.assertEqual(response.status_code, 200)
+        html = response.get_data(as_text=True)
+        self.assertIn('type="application/ztbrowser-trusted-inputs+json"', html)
+        self.assertIn('data-ztf-group="demo-group"', html)
+        self.assertIn('data-ztf-field="secret"', html)
+        self.assertIn('data-zts-group="demo-group"', html)
+        self.assertIn("http://demo.example/.well-known/attestation", html)
+
+    def test_attestation_route_uses_request_origin_for_trusted_input_claim(self) -> None:
+        client = server.app.test_client()
+        response = client.post(
+            "/.well-known/attestation",
+            json={"NONCE": "02" * 32},
+            base_url="http://demo.example",
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        claim = payload["claims"]["trusted_input_service"]
+        self.assertEqual(claim["endpoint_origin"], "http://demo.example")
+        self.assertIn("http://demo.example", claim["allowed_page_origins"])
+        self.assertEqual(claim["profiles"][0]["submit"]["url"], "http://demo.example/v1/submit")
+        self.assertIn("http://localhost", claim["allowed_page_origins"])
+        self.assertIn("http://127.0.0.1", claim["allowed_page_origins"])
+        self.assertNotIn("http://localhost:80", claim["allowed_page_origins"])
+        self.assertNotIn("http://127.0.0.1:80", claim["allowed_page_origins"])
+
+    def test_secure_submit_plaintext_fallback_redacts_values(self) -> None:
+        client = server.app.test_client()
+        response = client.post(
+            "/v1/submit",
+            json={"secret": "hunter2", "username": "alice"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["ok"], True)
+        with open(server.SUBMIT_LOG, "r", encoding="utf-8") as submit_log:
+            entries = json.load(submit_log)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["encrypted"], False)
+        self.assertEqual(entries[0]["fields"], {"secret": "[redacted]"})
+        self.assertEqual(entries[0]["username"], "alice")
+        self.assertEqual(entries[0]["password_length"], 7)
 
     def test_vsock_http_action_runs_app_inside_trusted_process(self) -> None:
         challenge = "ef" * 32

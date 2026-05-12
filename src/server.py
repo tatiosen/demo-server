@@ -3,7 +3,6 @@ import hashlib
 import json
 import os
 import re
-import secrets
 import socket
 import subprocess
 import time
@@ -15,9 +14,10 @@ import cbor2
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, utils
+from cryptography.hazmat.primitives.asymmetric.ec import ECDH, EllipticCurvePublicNumbers, SECP256R1
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.x509.oid import NameOID
-from flask import Flask, jsonify, redirect, render_template_string, request, url_for
-from werkzeug.security import generate_password_hash
+from flask import Flask, jsonify, make_response, redirect, render_template_string, request, url_for
 
 DEFAULT_PORT = 5005
 DEFAULT_REPO_URL = "https://github.com/tatiosen/demo-server"
@@ -38,7 +38,6 @@ app = Flask(__name__)
 MODE = {"value": "unset"}
 ATTESTATION_SOURCE = os.environ.get("ATTESTATION_SOURCE", "demo").strip().lower()
 ATTESTATION_MODE = {"value": os.environ.get("ATTESTATION_MODE", "tampered").strip().lower()}
-DB_FILE = os.environ.get("DB_FILE", "password_store.json")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEMO_PKI_DIR = os.path.join(BASE_DIR, "..", "fixtures", "demo-pki")
@@ -54,6 +53,8 @@ OCI_IMAGE_DIGEST = os.environ.get("OCI_IMAGE_DIGEST", DEFAULT_OCI_IMAGE_DIGEST)
 NSM_ATTESTOR_BIN = os.environ.get("NSM_ATTESTOR_BIN", DEFAULT_NSM_ATTESTOR_BIN)
 RUNTIME_MODE = os.environ.get("RUNTIME_MODE", "").strip().lower()
 COCO_RUNTIME_CONFIG_PATH = os.environ.get("COCO_RUNTIME_CONFIG_PATH", DEFAULT_COCO_CONFIG_PATH)
+HOST_ORIGIN = os.environ.get("HOST_ORIGIN", "").rstrip("/")
+SUBMIT_LOG = os.environ.get("SUBMIT_LOG", os.path.join(BASE_DIR, "..", "submit_log.json"))
 
 if ATTESTATION_SOURCE not in ("demo", "nitro"):
     ATTESTATION_SOURCE = "demo"
@@ -162,6 +163,7 @@ def b64(data: bytes) -> str:
 
 
 RESPONSE_SIGNING_KEY = ec.generate_private_key(ec.SECP256R1())
+WORKLOAD_KEY = ec.generate_private_key(ec.SECP256R1())
 
 
 def canonical_json(value: object) -> str:
@@ -176,6 +178,17 @@ def response_public_jwk() -> dict:
         "ext": True,
         "key_ops": ["verify"],
         "kty": "EC",
+        "x": b64url(numbers.x.to_bytes(size, "big")),
+        "y": b64url(numbers.y.to_bytes(size, "big")),
+    }
+
+
+def workload_public_jwk() -> dict:
+    numbers = WORKLOAD_KEY.public_key().public_numbers()
+    size = 32
+    return {
+        "kty": "EC",
+        "crv": "P-256",
         "x": b64url(numbers.x.to_bytes(size, "big")),
         "y": b64url(numbers.y.to_bytes(size, "big")),
     }
@@ -299,6 +312,77 @@ def runtime_identity() -> tuple[str, str, str]:
     return service_name(), release_id(), platform
 
 
+def endpoint_origin_for_request(request_origin: str | None = None) -> str:
+    if request_origin:
+        return request_origin.rstrip("/")
+    if HOST_ORIGIN:
+        return HOST_ORIGIN
+    return "http://localhost:9999"
+
+
+def allowed_page_origins(endpoint_origin: str) -> list[str]:
+    parsed = urlparse(endpoint_origin)
+    default_port = 443 if parsed.scheme == "https" else 80
+    port = parsed.port or default_port
+    localhost_origin = f"{parsed.scheme}://localhost" if port == default_port else f"{parsed.scheme}://localhost:{port}"
+    loopback_origin = f"{parsed.scheme}://127.0.0.1" if port == default_port else f"{parsed.scheme}://127.0.0.1:{port}"
+    defaults = [
+        endpoint_origin,
+        localhost_origin,
+        loopback_origin,
+    ]
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for origin in defaults:
+        if origin and origin not in seen:
+            ordered.append(origin)
+            seen.add(origin)
+    return ordered
+
+
+def trusted_input_service_claim(endpoint_origin: str) -> dict:
+    return {
+        "version": "ztbrowser-trusted-inputs/v1",
+        "endpoint_origin": endpoint_origin,
+        "allowed_page_origins": allowed_page_origins(endpoint_origin),
+        "profiles": [
+            {
+                "profile_id": "demo-v1",
+                "fields": [
+                    {
+                        "field_id": "secret",
+                        "kind": "secret",
+                        "required": True,
+                        "label": "Password",
+                    }
+                ],
+                "submit": {"method": "POST", "url": f"{endpoint_origin}/v1/submit"},
+            }
+        ],
+    }
+
+
+def trusted_inputs_manifest(endpoint_origin: str) -> str:
+    manifest = {
+        "version": "ztbrowser-trusted-inputs/v1",
+        "endpoint_refs": [
+            {
+                "endpoint_ref": "demo",
+                "origin": endpoint_origin,
+                "attestation_url": f"{endpoint_origin}/.well-known/attestation",
+            }
+        ],
+        "groups": [
+            {
+                "group_id": "demo-group",
+                "endpoint_ref": "demo",
+                "profile_id": "demo-v1",
+            }
+        ],
+    }
+    return json.dumps(manifest, indent=2)
+
+
 def build_nitro_attestation_doc(nonce: str, public_jwk: dict, binding: str) -> str:
     nonce_bytes = parse_nonce_to_bytes(nonce)
     public_key_b64 = b64(canonical_json(public_jwk).encode())
@@ -391,12 +475,15 @@ def build_attestation_envelope(
     service_override: str | None = None,
     release_override: str | None = None,
     facts_url_override: str | None = None,
+    endpoint_origin_override: str | None = None,
 ) -> dict:
     platform = platform or current_platform()
     public_jwk = response_public_jwk()
+    workload_jwk = workload_public_jwk()
     key_id = response_key_id(public_jwk)
     service = service_override or service_name()
     rel = release_override or release_id()
+    endpoint_origin = endpoint_origin_for_request(endpoint_origin_override)
     if platform == COCO_PLATFORM:
         config = load_coco_config()
         service = str(config.get("service") or service)
@@ -415,11 +502,12 @@ def build_attestation_envelope(
             "platform": platform,
             "nonce": nonce,
             "claims": {
-                "workload_pubkey": config.get("workload_pubkey"),
+                "workload_pubkey": json.dumps(workload_jwk, separators=(",", ":")),
                 "identity_hint": config.get("identity_hint"),
                 "response_signing_key": public_jwk,
                 "response_signing_key_id": key_id,
                 "response_signing_key_binding": binding,
+                "trusted_input_service": trusted_input_service_claim(endpoint_origin),
             },
             "evidence": {
                 "type": "coco_trustee_evidence",
@@ -437,11 +525,12 @@ def build_attestation_envelope(
         "platform": platform,
         "nonce": nonce,
         "claims": {
-            "workload_pubkey": None,
+            "workload_pubkey": json.dumps(workload_jwk, separators=(",", ":")),
             "identity_hint": None,
             "response_signing_key": public_jwk,
             "response_signing_key_id": key_id,
             "response_signing_key_binding": binding,
+            "trusted_input_service": trusted_input_service_claim(endpoint_origin),
         },
         "evidence": {
             "type": "aws_nitro_attestation_doc",
@@ -459,6 +548,7 @@ HTML = """
 <head>
     <meta charset="utf-8" />
     <title>Trusted Compute Demo</title>
+    <script type="application/ztbrowser-trusted-inputs+json">{{ manifest|safe }}</script>
     <style>
     body { font-family: system-ui, sans-serif; max-width: 800px; margin: 40px auto; padding: 0 16px; }
     .card { border: 1px solid white; border-radius: 12px; padding: 16px; margin-top: 16px; }
@@ -508,28 +598,35 @@ HTML = """
     <div class="small">Attestation endpoint: <code>POST /.well-known/attestation</code></div>
     <div class="small">Page mode: <code>{{ mode }}</code></div>
     <div class="small">Attestation mode: <code>{{ attestation_mode }}</code></div>
+    <div class="small">Trusted endpoint origin: <code>{{ endpoint_origin }}</code></div>
 
-    <form id="form" method="POST" action="/register">
-        <input
-            type="text"
-            id="usernameField"
-            name="username"
-            class="input-neutral"
-            placeholder="Enter username"
-            style="margin-bottom: 10px;"
-        >
+    <div class="card">
+        <h2>Secure Input</h2>
+        <p class="small">
+            ZTBrowser intercepts this field, encrypts it for the attested workload, and submits it directly to the trusted endpoint.
+        </p>
         <input
             type="password"
             id="passwordField"
             name="secret"
             class="input-neutral"
-            placeholder="Enter password for registration"
+            data-ztf-group="demo-group"
+            data-ztf-field="secret"
+            placeholder="Enter password for secure submission"
+            autocomplete="off"
+        >
+        <input
+            type="text"
+            id="usernameField"
+            name="username"
+            placeholder="Optional label stored outside the secure field"
+            style="margin-top: 10px;"
         >
         <div class="row" style="margin-top: 10px;">
-            <button type="submit" id="submitBtn">Register</button>
+            <button type="button" id="submitBtn" data-zts-group="demo-group">Submit Securely</button>
             <a href="/records">View stored records</a>
         </div>
-    </form>
+    </div>
 
     <div class="small" id="hint"></div>
 
@@ -538,40 +635,41 @@ function setMode(mode) {
     window.location.href = "/set-mode?mode=" + mode;
 }
 
-document.getElementById("form").addEventListener("submit", async (e) => {
-    e.preventDefault();
+const usernameField = document.getElementById("usernameField");
+const field = document.getElementById("passwordField");
+const hint = document.getElementById("hint");
 
-    const usernameField = document.getElementById("usernameField");
-    const field = document.getElementById("passwordField");
-    const hint = document.getElementById("hint");
-
+document.getElementById("submitBtn").addEventListener("click", async () => {
     hint.textContent = "";
-    usernameField.classList.remove("input-bad");
-    usernameField.classList.add("input-neutral");
     field.classList.remove("input-bad");
     field.classList.add("input-neutral");
 
-    const formData = new FormData(e.target);
-
-    const res = await fetch("/register", {
-        method: "POST",
-        body: formData
-    });
-
-    const data = await res.json().catch(() => ({}));
-
-    if (!res.ok) {
-        usernameField.classList.remove("input-neutral");
-        usernameField.classList.add("input-bad");
+    if (!field.value) {
+        hint.textContent = "Password is empty.";
         field.classList.remove("input-neutral");
         field.classList.add("input-bad");
-        hint.textContent = data.error || "Registration failed";
         return;
     }
 
-    usernameField.value = "";
+    const res = await fetch("/v1/submit", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+            secret: field.value,
+            username: usernameField.value
+        })
+    });
+
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) {
+        hint.textContent = data.error || "Secure submission failed";
+        field.classList.remove("input-neutral");
+        field.classList.add("input-bad");
+        return;
+    }
+
     field.value = "";
-    hint.textContent = data.message || "Registered successfully";
+    hint.textContent = data.message || "Submitted securely";
 });
 </script>
 </body>
@@ -580,23 +678,41 @@ document.getElementById("form").addEventListener("submit", async (e) => {
 
 
 def load_records() -> list:
-    if not os.path.exists(DB_FILE):
+    if not os.path.exists(SUBMIT_LOG):
         return []
-    with open(DB_FILE, "r", encoding="utf-8") as records_file:
+    with open(SUBMIT_LOG, "r", encoding="utf-8") as records_file:
         return json.load(records_file)
 
 
 def save_records(records: list) -> None:
-    with open(DB_FILE, "w", encoding="utf-8") as records_file:
+    with open(SUBMIT_LOG, "w", encoding="utf-8") as records_file:
         json.dump(records, records_file, indent=2)
+
+
+def b64url_decode(value: str) -> bytes:
+    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+
+
+def decrypt_ecdh_payload(body: dict) -> dict:
+    epk = body["epk"]
+    x = int.from_bytes(b64url_decode(epk["x"]), "big")
+    y = int.from_bytes(b64url_decode(epk["y"]), "big")
+    eph_pub = EllipticCurvePublicNumbers(x, y, SECP256R1()).public_key()
+    shared = WORKLOAD_KEY.exchange(ECDH(), eph_pub)
+    iv = base64.b64decode(body["iv"])
+    ciphertext = base64.b64decode(body["ciphertext"])
+    return json.loads(AESGCM(shared).decrypt(iv, ciphertext, None))
 
 
 @app.get("/")
 def index():
+    endpoint_origin = endpoint_origin_for_request(request.host_url.rstrip("/"))
     return render_template_string(
         HTML,
+        manifest=trusted_inputs_manifest(endpoint_origin),
         mode=MODE["value"],
         attestation_mode=ATTESTATION_MODE["value"],
+        endpoint_origin=endpoint_origin,
     )
 
 
@@ -638,35 +754,39 @@ def sign_challenged_response(response):
 def attestation():
     body = request.get_json(silent=True) or {}
     nonce = body.get("NONCE", "")
-    return jsonify(build_attestation_envelope(str(nonce)))
+    endpoint_origin = endpoint_origin_for_request(request.host_url.rstrip("/"))
+    return jsonify(build_attestation_envelope(str(nonce), endpoint_origin_override=endpoint_origin))
 
 
-@app.post("/register")
-def register():
+@app.post("/v1/submit")
+def trusted_submit():
     if MODE["value"] != "verified":
         return jsonify({"ok": False, "error": "Server is not in verified mode."}), 403
 
-    username = request.form.get("username", "").strip()
-    secret = request.form.get("secret", "").strip()
-    if not username:
-        return jsonify({"ok": False, "error": "Username is empty."}), 400
+    body = request.get_json(silent=True) or {}
+    if body.get("alg") == "ECDH-P256-AES256GCM":
+        try:
+            fields = decrypt_ecdh_payload(body)
+        except Exception as exc:
+            return jsonify({"ok": False, "error": f"decrypt_failed: {exc}"}), 400
+        encrypted = True
+    else:
+        fields = {key: value for key, value in body.items() if key != "alg"}
+        encrypted = False
+
+    username = str(fields.get("username", "")).strip()
+    secret = str(fields.get("secret", "")).strip()
     if not secret:
         return jsonify({"ok": False, "error": "Password is empty."}), 400
 
     records = load_records()
-    if any(record.get("username", "").lower() == username.lower() for record in records):
-        return jsonify({"ok": False, "error": "Username already exists."}), 409
-
-    password_hash = generate_password_hash(secret)
-    session_token = secrets.token_urlsafe(32)
-    session_token_hash = hashlib.sha256(session_token.encode()).hexdigest()
     records.append(
         {
-            "username": username,
             "created_at": datetime.utcnow().isoformat() + "Z",
-            "password_hash": password_hash,
+            "encrypted": encrypted,
+            "fields": {key: "[redacted]" for key in fields if key != "username"},
             "password_length": len(secret),
-            "session_token_hash": session_token_hash,
+            "username": username or None,
         }
     )
     save_records(records)
@@ -674,8 +794,7 @@ def register():
     return jsonify(
         {
             "ok": True,
-            "message": "Registered and stored as hash only.",
-            "session_token": session_token,
+            "message": "Secure submission accepted.",
         }
     )
 
@@ -683,19 +802,22 @@ def register():
 @app.get("/records")
 def records():
     return f"""
-    <h2>Stored registration records</h2>
-    <p>Usernames and password hashes are stored. Plaintext passwords are never saved.</p>
+    <h2>Stored submission records</h2>
+    <p>Plaintext field values are never saved. The log only records field names, password length, and whether the submit was encrypted.</p>
     <pre>{json.dumps(load_records(), indent=2)}</pre>
     <p><a href="/">Back</a></p>
     """
 
 
 def render_index_html() -> str:
+    endpoint_origin = endpoint_origin_for_request()
     with app.app_context():
         return render_template_string(
             HTML,
+            manifest=trusted_inputs_manifest(endpoint_origin),
             mode=MODE["value"],
             attestation_mode=ATTESTATION_MODE["value"],
+            endpoint_origin=endpoint_origin,
         )
 
 
@@ -742,6 +864,7 @@ def handle_vsock_request(raw_request: bytes) -> bytes:
             service_override=service,
             release_override=rel,
             facts_url_override=message.get("facts_url"),
+            endpoint_origin_override=message.get("origin") or message.get("endpoint_origin"),
         )
         body = json.dumps(envelope, separators=(",", ":")).encode()
         response = {
