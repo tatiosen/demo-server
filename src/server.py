@@ -322,11 +322,14 @@ def endpoint_origin_for_request(request_origin: str | None = None) -> str:
 
 def allowed_page_origins(endpoint_origin: str) -> list[str]:
     parsed = urlparse(endpoint_origin)
-    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    default_port = 443 if parsed.scheme == "https" else 80
+    port = parsed.port or default_port
+    localhost_origin = f"{parsed.scheme}://localhost" if port == default_port else f"{parsed.scheme}://localhost:{port}"
+    loopback_origin = f"{parsed.scheme}://127.0.0.1" if port == default_port else f"{parsed.scheme}://127.0.0.1:{port}"
     defaults = [
         endpoint_origin,
-        f"{parsed.scheme}://localhost:{port}",
-        f"{parsed.scheme}://127.0.0.1:{port}",
+        localhost_origin,
+        loopback_origin,
     ]
     seen: set[str] = set()
     ordered: list[str] = []

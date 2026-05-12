@@ -137,6 +137,10 @@ class ResponseSigningTests(unittest.TestCase):
         self.assertEqual(claim["endpoint_origin"], "http://demo.example")
         self.assertIn("http://demo.example", claim["allowed_page_origins"])
         self.assertEqual(claim["profiles"][0]["submit"]["url"], "http://demo.example/v1/submit")
+        self.assertIn("http://localhost", claim["allowed_page_origins"])
+        self.assertIn("http://127.0.0.1", claim["allowed_page_origins"])
+        self.assertNotIn("http://localhost:80", claim["allowed_page_origins"])
+        self.assertNotIn("http://127.0.0.1:80", claim["allowed_page_origins"])
 
     def test_secure_submit_plaintext_fallback_redacts_values(self) -> None:
         client = server.app.test_client()
